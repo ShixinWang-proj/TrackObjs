@@ -9,14 +9,22 @@ class TrackState:
 class Track:
     _count = 0
 
-    def __init__(self, interval, dt=1.0, state=TrackState.CONFIRMED):
+    def __init__(self, interval, right_b, dt=1.0, state=TrackState.TENTATIVE, confirm_threshold=5):
         self.id = Track._count
-        self.state = state  # 👈 新增
+        self.right_b = right_b
+        self.state = state  # 临时轨迹还是确定轨迹
         self.spawn_time = 0  # 👈 新增（由外部赋值）
         self.tentative_age = 0  # 👈 新增  for 多尾
         Track._count += 1
+        self.confirm_threshold = confirm_threshold
+        self.hit_count = 0
 
         self.dt = dt
+        self.updated = False  # 当前帧是否被 update
+        self.age = 0
+        self.missed = False
+        self.history = []
+        self.status = None
 
         # -------- state: [c, v, w] --------
         c = 0.5 * (interval[0] + interval[1])
@@ -52,17 +60,32 @@ class Track:
         ])
         self.R = np.diag([0.005, 0.005])
 
-        self.age = 1
-        self.missed = False
-        self.history = []
-
     # ===============================
     # predict
     # ===============================
-    def predict(self):
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
-        self.age += 1
+
+    def _predict_with_ls(self):
+        """
+        使用最小二乘速度预测下一帧，在predict中调用
+        """
+        self.updated = False  # ⭐ 本帧未 update
+        T = self.confirm_threshold
+        v_ls = self.velocity_ls(T)
+        self.x[0, 0] = self.x[0, 0] + v_ls * self.dt
+        self.x[1, 0] = v_ls  # 同步速度状态
+
+        # 协方差仍然按模型推进
+        # self.P = self.F @ self.P @ self.F.T + self.Q
+        # self.age += 1
+
+    def predict(self, use_ls=False):
+        # 去掉了updated=False，否则每次执行这个函数都会变成False
+        if use_ls:
+            self._predict_with_ls()
+        else:
+            self.x = self.F @ self.x
+            self.P = self.F @ self.P @ self.F.T + self.Q
+            # self.age += 1
 
     # ===============================
     # update
@@ -79,17 +102,24 @@ class Track:
 
         self.x = self.x + K @ y
         self.P = (np.eye(3) - K @ self.H) @ self.P
+
         self.age = 0
+        self.hit_count += 1  # 需要很准确
+        self.updated = True  # ⭐ 标记本帧发生了 update
+
+        # ⭐ 满 5 次 update → 转为 CONFIRMED
+        if self.state == TrackState.TENTATIVE and self.hit_count >= self.confirm_threshold:
+            self.state = TrackState.CONFIRMED
 
     def interval(self):
         c, w = self.x[0, 0], self.x[2, 0]
         return np.array([c - w / 2, c + w / 2])
 
     def snapshot(self, time):
-        return [self.x[0, 0], self.x[2, 0], time, self.x[1, 0]]  # c,w
+        return [self.x[0, 0], self.x[2, 0], time, self.x[1, 0]]  # c,v,w
 
     def clone(self, time):
-        new_track = Track(self.interval(), dt=self.dt,
+        new_track = Track(self.interval(), right_b=self.right_b, dt=self.dt,
                           state=TrackState.TENTATIVE)
 
         new_track.x = self.x.copy()
@@ -103,26 +133,43 @@ class Track:
 
         return new_track
 
-    def step_tentative(self, is_many_to_one, T_window=5):
+    def step_tentative(self, matched: bool, max_age=4):
         """
-        is_many_to_one: bool
-            当前时刻是否仍然处于 多对一匹配
+        更新 TENTATIVE 轨迹状态
+
+        Parameters
+        ----------
+        matched : bool
+            本帧是否匹配到了观测
+        T_confirm : int
+            累计 update 次数达到 T_confirm → 转为 CONFIRMED
+        max_age : int
+            连续未匹配帧数超过 max_age → 删除
+
+        Returns
+        -------
+        None
         """
         if self.state != TrackState.TENTATIVE:
-            return "confirmed"
+            self.status = "confirmed"
 
-        self.tentative_age += 1
+        # 连续未匹配帧数
+        if not matched:
+            self.age += 1
+        else:
+            self.age = 0
+            # self.hit_count += 1  # tentative 也累积 update 次数
 
-        # 只要出现过 非多对一
-        if not is_many_to_one:
+        # 确认条件：累计 hit_count >= T_confirm
+        if self.hit_count >= self.confirm_threshold:
             self.state = TrackState.CONFIRMED
-            return "confirmed"
+            self.status = "confirmed"
 
-        # 时间窗口耗尽，且全是多对一
-        if self.tentative_age >= T_window:
-            return "delete"
+        # 删除条件：连续未匹配帧数超过 max_age , or超出界限之外
+        if self.age > max_age or self.x[0, 0] > self.right_b:
+            self.status = "delete"
 
-        return "tentative"
+        self.status = "tentative"
 
     def mean_velocity(self, T=5):
         """
@@ -220,11 +267,42 @@ class Track:
 
         # 协方差放大（不确定性）
         nt.P = base_track.P.copy()
-        nt.P[0, 0] *= 1.5
-        nt.P[2, 2] *= 1.5
+        # nt.P[0, 0] *= 1.5
+        # nt.P[2, 2] *= 1.5
 
         nt.history = [h.copy() for h in history]
         nt.spawn_time = time
         nt.tentative_age = 0
 
         return nt
+
+    def get_state(self):
+        """
+        返回当前状态（位置、速度）
+
+        return:
+            dict {
+                "id": int,
+                "c": float,      # 中心位置
+                "v": float,      # 速度
+                "w": float,      # 宽度
+                "interval": (l, r)
+            }
+        """
+        c = round(float(self.x[0, 0]), 2)
+        v = round(float(self.x[1, 0]), 2)
+        w = round(float(self.x[2, 0]), 2)
+
+        return {
+            "id": self.id,
+            "c": c,
+            "v": v,
+            "w": w,
+            "interval": (c - w / 2, c + w / 2),
+
+            # ⭐ 新增
+            "updated": self.updated,           # True: 本帧 update；False: 仅 predict
+            "state": self.state,
+            "age": self.age,                   # 连续未匹配帧数
+            "hit_count": self.hit_count        # 累计 update 次数
+        }

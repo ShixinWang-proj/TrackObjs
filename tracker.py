@@ -21,10 +21,10 @@ class Tracker:
         self.many2one_records = []
         self.icjc = []
 
-    def update(self, measurements, time, sig, iou_threshold=0.1, T_vel=5):
+    def update(self, measurements, time, sig, iou_threshold=0.1):
 
         # ---------- 0. 初始化 ----------
-        if not self.tracks:
+        if not self.tracks:  #  空轨迹 就执行初始化
             self._initiate(measurements)
             return
 
@@ -49,8 +49,6 @@ class Tracker:
                         matches.append((i, j, s))
 
         if len(matches) == 0:
-            for t in self.tracks:
-                t.predict()
             return
 
         filtered_matches_s = np.array(matches)
@@ -87,6 +85,7 @@ class Tracker:
                         (filtered_matches_s[:, 0] == i) |
                         (filtered_matches_s[:, 1] == j)
                 )
+
                 triples = filtered_matches_s[mask]
 
                 obs_ids = sorted(set(triples[:, 0].astype(int)))
@@ -117,10 +116,7 @@ class Tracker:
 
         # ---------- unmatched ----------
         unmatched_ob = list(set(range(len(obs))) - set(filtered_matches[:, 0]) - used_obs)
-        unmatched_pred = list(set(range(len(preds))) - set(filtered_matches[:, 1]) - used_pred)
-
-        for j in unmatched_pred:
-            self.tracks[j].predict()
+        # unmatched_pred = list(set(range(len(preds))) - set(filtered_matches[:, 1]) - used_pred)
 
         # ---------- 统计 ----------
         i_vals = filtered_matches[:, 0]
@@ -192,8 +188,6 @@ class Tracker:
 
                 if right > left:
                     self.tracks[j].update((left, right))
-                else:
-                    self.tracks[j].predict()
 
         # ==========================================================
         # 7️⃣ 多对多（已转为多对一）→ 交集更新
@@ -207,30 +201,60 @@ class Tracker:
 
                 if right > left:
                     self.tracks[j].update((left, right))
-                else:
-                    self.tracks[j].predict()
 
         # ==========================================================
         # 8️⃣ 新生轨迹
         # ==========================================================
         for i in unmatched_ob:
             if self.left_b[0] <= obs[i][1] <= self.left_b[1] and obs_el_labels[i] in [2, 3]:
-                self.tracks.append(Track(obs[i]))
+                tr = Track(obs[i], right_b=self.right_b, state=TrackState.TENTATIVE)
+                self.tracks.append(tr)
 
+        # 此时self.tracks中，有些已经update，状态空间更新为当前时刻；未匹配到的还是预测状态；新加入的只有clone环节，也已经更新过。
         # ---------- 记录历史 ----------
         alive = []
-        for t in self.tracks:
-            if t.state == TrackState.TENTATIVE:
-                if t.step_tentative(False) == "delete":
+        for tr in self.tracks:
+            if tr.x[0, 0] > self.right_b:
+                self.records[tr.id] = tr.history
+                continue
+            if tr.state == TrackState.TENTATIVE:  # 对于临时的轨迹
+                matched = tr.updated  # 本帧是否 update
+                tr.step_tentative(matched, max_age=self.max_age)
+                if tr.status == "delete":  # 已经移除了删除的轨迹
+                    self.records[tr.id] = tr.history  # 删除时才加入记录
                     continue
-            alive.append(t)
-
+            alive.append(tr)
+            tr.history.append(tr.snapshot(time))
         self.tracks = alive
 
-        for t in self.tracks:
-            t.history.append(t.snapshot(time))
-
         self.tracks.sort(key=lambda t: t.x[0, 0])
+
+    def predict(self):  # 对alive的轨迹进行预测, 匹配到的预测，未匹配到的也预测
+        """
+
+        self.tracks' cases
+        state: Tentative, Confirmed
+        status: tentative, confirmed, delete
+        status <= state
+        updated: True, False
+        age,
+        """
+        for tr in self.tracks:
+            use_ls = (tr.status == "confirmed") and (not tr.updated)
+            tr.predict(use_ls)
+
+        # to_delete = []
+        #
+        # for t in self.tracks:
+        #     if t.age <= self.max_age or t.updated == True:
+        #         t.predict()
+        #     else:
+        #         t.missed = True
+        #         self.records[t.id] = t.history
+        #         to_delete.append(t)
+        #
+        # for t in to_delete:
+        #     self.tracks.remove(t)
 
     @staticmethod
     def _classify(el):
@@ -261,23 +285,10 @@ class Tracker:
         e = np.array([sum(sig[int(i[0]):int(i[1])]**2) for i in pulses])
         return np.c_[e, l]
 
-    def predict(self, time):
-        to_delete = []
-
-        for t in self.tracks:
-            if t.age <= self.max_age:
-                t.predict()
-            else:
-                t.missed = True
-                self.records[t.id] = t.history
-                to_delete.append(t)
-
-        for t in to_delete:
-            self.tracks.remove(t)
-
     def _initiate(self, measurements):
         for m in measurements:
-            self.tracks.append(Track(m))
+            tr = Track(m, right_b=self.right_b, state=TrackState.TENTATIVE)
+            self.tracks.append(tr)
 
     @staticmethod
     def iou(a, b):
@@ -326,11 +337,22 @@ class Tracker:
 
         return result
 
+    def get_track_state_by_id(self, tid):
+        """
+        根据 track id 返回状态
+        """
+        for t in self.tracks:
+            if t.id == tid:
+                return t.get_state()
+        return None
+
 
 if __name__ == "__main__":
     from matplotlib import rcParams
     from plot import plot_histories, plot_observations_with_centers
+    import pandas as pd
     rcParams['font.family'] = "Times New Roman"
+    tmp = []
     for i in tqdm(range(1, 6)):
         arr = np.load(f"D:/code/fiber/data/npy/{i}.npy")[:, 100:2800]
         Observations = np.load("D:/code/fiber/gitCode/pulseDL/Pred_intervals.npy", allow_pickle=True)[(i-1)*300:i*300]
@@ -338,11 +360,12 @@ if __name__ == "__main__":
         tracker = Tracker()
         for t, m in enumerate(Observations):
             tracker.update(m, t, arr[t])
-            tracker.predict(t)
+            tracker.predict()
 
         for tr in tracker.tracks:
             tracker.records[tr.id] = tr.history
 
+        # pd.DataFrame(tmp).to_csv("aa.csv", index=False)
         plot_histories(tracker.records, savepath=f"tracks_v3_one2m_{i}.png")
         # plot_observations_with_centers(Observations, save_path=f"ob_with_centers_{i}.png")
 
