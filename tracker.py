@@ -1,44 +1,44 @@
 import numpy as np
-from track import Track, TrackState
-from observation import Observation
 from tqdm import tqdm
+from track import Track, TrackState, MatchMode
 
 
 class Tracker:
-
-    def __init__(self, max_age=4, left_b=(0, 100)):
+    def __init__(self, max_age=3, left_b=(0, 300)):
         self.tracks = []
-        self.age = 0
         self.max_age = max_age
         self.records = {}
-        # 左右边界
         self.left_b = left_b
         self.right_b = 2700
 
-        # stat
+        # 统计项
         self.unmatched_ob_el = []
         self.one2many = []
         self.many2one_records = []
         self.icjc = []
 
-    def update(self, measurements, time, sig, iou_threshold=0.1):
+    def update(self, measurements, time, sig, iou_threshold=0.1, merge_threshold=13):
+        for tr in self.tracks:
+            tr.matched = False
+
+        # ---------- 0️⃣ 过滤越界观测 ----------
+        measurements = [m for m in measurements if 50 < m[1] < self.right_b-50]
+
+        if len(measurements) == 0: return
 
         # ---------- 0. 初始化 ----------
-        if not self.tracks:  #  空轨迹 就执行初始化
+        if not self.tracks:
             self._initiate(measurements)
             return
 
-        # ---------- 1. 构造预测 & 观测 ----------
-        ini_mea = [Observation(m) for m in measurements]
-        energy = np.array([m.get_e(sig) for m in ini_mea])
-        length = np.array([m.L for m in ini_mea])
-        obs_el_labels = self._classify(np.c_[energy, length])
+        # ---------- 1. 构造预测 & 观测分类 ----------
+        # 此处简化 Observation 处理逻辑
+        obs = np.array([m for m in measurements])
+        energy_list = [np.sum(sig[int(m[0]):int(m[1])] ** 2) for m in measurements]
+        length_list = [m[1] - m[0] for m in measurements]
+        obs_el_labels = self._classify(np.c_[energy_list, length_list])
 
-        obs = np.array([i.observation for i in ini_mea])
         preds = np.array([t.interval() for t in self.tracks])
-
-        preds_el = self.get_el(preds, sig)
-        preds_el_labels = self._classify(preds_el)
 
         matches = []
         for i, obi in enumerate(obs):
@@ -48,94 +48,40 @@ class Tracker:
                     if s >= iou_threshold:
                         matches.append((i, j, s))
 
-        if len(matches) == 0:
-            return
+        if len(matches) == 0: return
 
         filtered_matches_s = np.array(matches)
         filtered_matches = filtered_matches_s[:, :2].astype(int)
 
-        i_vals = filtered_matches[:, 0]
-        j_vals = filtered_matches[:, 1]
+        i_count_dict = dict(zip(*np.unique(filtered_matches[:, 0], return_counts=True)))
+        j_count_dict = dict(zip(*np.unique(filtered_matches[:, 1], return_counts=True)))
 
-        unique_i, i_counts = np.unique(i_vals, return_counts=True)
-        unique_j, j_counts = np.unique(j_vals, return_counts=True)
-
-        i_count_dict = dict(zip(unique_i, i_counts))
-        j_count_dict = dict(zip(unique_j, j_counts))
-
-        # ==========================================================
-        # 2️⃣ 处理多对多（ic>1 && jc>1） → 合并观测 → 多对一
-        # ==========================================================
-        group_mm = []
-        used_obs = set()
-        used_pred = set()
-
+        # ---------- 2️⃣ 处理多对多 -> 转为多对一 ----------
+        group_mm, used_obs, used_pred = [], set(), set()
         for i, j, s in filtered_matches_s:
-            i = int(i)
-            j = int(j)
-
-            if i in used_obs or j in used_pred:
-                continue
-
-            ic = i_count_dict[i]
-            jc = j_count_dict[j]
-
-            if ic > 1 and jc > 1:
-                mask = (
-                        (filtered_matches_s[:, 0] == i) |
-                        (filtered_matches_s[:, 1] == j)
-                )
-
+            i, j = int(i), int(j)
+            if i in used_obs or j in used_pred: continue
+            if i_count_dict[i] > 1 and j_count_dict[j] > 1:
+                mask = (filtered_matches_s[:, 0] == i) | (filtered_matches_s[:, 1] == j)
                 triples = filtered_matches_s[mask]
+                o_ids = sorted(set(triples[:, 0].astype(int)))
+                p_ids = sorted(set(triples[:, 1].astype(int)))
+                merged_obs = (min(obs[k][0] for k in o_ids), max(obs[k][1] for k in o_ids))
+                group_mm.append({"obs_ids": o_ids, "pred_ids": p_ids, "merged_obs": merged_obs})
+                used_obs.update(o_ids)
+                used_pred.update(p_ids)
 
-                obs_ids = sorted(set(triples[:, 0].astype(int)))
-                pred_ids = sorted(set(triples[:, 1].astype(int)))
-
-                merged_obs = (
-                    min(obs[k][0] for k in obs_ids),
-                    max(obs[k][1] for k in obs_ids),
-                )
-
-                group_mm.append({
-                    "obs_ids": obs_ids,
-                    "pred_ids": pred_ids,
-                    "merged_obs": merged_obs,
-                })
-
-                used_obs.update(obs_ids)
-                used_pred.update(pred_ids)
-
-        # ==========================================================
-        # 3️⃣ 剩余匹配（排除多对多）
-        # ==========================================================
-        mask = [
-            (i not in used_obs) and (j not in used_pred)
-            for i, j in filtered_matches
-        ]
+        # ---------- 3️⃣ 剩余匹配分类 ----------
+        mask = [(i not in used_obs and j not in used_pred) for i, j in filtered_matches]
         filtered_matches = filtered_matches[mask]
-
-        # ---------- unmatched ----------
         unmatched_ob = list(set(range(len(obs))) - set(filtered_matches[:, 0]) - used_obs)
-        # unmatched_pred = list(set(range(len(preds))) - set(filtered_matches[:, 1]) - used_pred)
 
-        # ---------- 统计 ----------
-        i_vals = filtered_matches[:, 0]
-        j_vals = filtered_matches[:, 1]
-
-        unique_i, i_counts = np.unique(i_vals, return_counts=True)
-        unique_j, j_counts = np.unique(j_vals, return_counts=True)
-
-        i_count_dict = dict(zip(unique_i, i_counts))
-        j_count_dict = dict(zip(unique_j, j_counts))
-
-        group_1to1 = []
-        group_i_multi = []  # 多预测 → 一个观测
-        group_j_multi = []  # 一个预测 → 多观测
+        group_1to1, group_i_multi, group_j_multi = [], [], []
+        i_counts = dict(zip(*np.unique(filtered_matches[:, 0], return_counts=True)))
+        j_counts = dict(zip(*np.unique(filtered_matches[:, 1], return_counts=True)))
 
         for i, j in filtered_matches:
-            ic = i_count_dict[i]
-            jc = j_count_dict[j]
-
+            ic, jc = i_counts[i], j_counts[j]
             if ic == 1 and jc == 1:
                 group_1to1.append((i, j))
             elif ic > 1 and jc == 1:
@@ -143,132 +89,110 @@ class Tracker:
             elif ic == 1 and jc > 1:
                 group_j_multi.append((i, j))
 
-        # ==========================================================
-        # 4️⃣ 一对一
-        # ==========================================================
+        # ---------- 4️⃣ 一对一更新 ----------
         for i, j in group_1to1:
             self.tracks[j].update(obs[i])
+            self.tracks[j].match_mode = MatchMode.ONE2ONE
 
-        # ==========================================================
-        # 5️⃣ 一个预测 → 多观测（clone）
-        # ==========================================================
-        groups_by_j = {}
-        for i, j in group_j_multi:
-            groups_by_j.setdefault(j, []).append(i)
+            # ==========================================================
+            # 5️⃣ 一对多（分支验证 + 惯性保护）
+            # ==========================================================
+            groups_by_j = {}
+            for i, j in group_j_multi:
+                groups_by_j.setdefault(j, []).append(i)
 
-        new_tracks = []
-        for j, obs_ids in groups_by_j.items():
-            if obs_el_labels[obs_ids[0]] in [2, 3]:
-                self.tracks[j].update(obs[obs_ids[0]])
+            new_tracks = []
 
-            for i in obs_ids[1:]:
-                if obs_el_labels[i] in [2, 3]:
-                    nt = self.tracks[j].clone(time)
-                    nt.update(obs[i])
-                    new_tracks.append(nt)
+            for j, obs_ids in groups_by_j.items():
+                tr = self.tracks[j]
 
-        self.tracks.extend(new_tracks)
+                # 1. 筛选有效观测
+                valid_obs_ids = [i for i in obs_ids if obs_el_labels[i] in [2, 3]]
+                if not valid_obs_ids:
+                    # 如果没有有效长脉冲，就按普通最近邻更新一个即可，或者跳过
+                    continue
 
-        # ==========================================================
-        # 6️⃣ 多预测 → 一个观测（交集更新）
-        # ==========================================================
+                # 2. 排序：找中心距离最近的，作为主轨迹的继承者
+                def get_distance(obs_idx):
+                    obs_c = 0.5 * (obs[obs_idx][0] + obs[obs_idx][1])
+                    pred_c = tr.x[0, 0]
+                    return abs(obs_c - pred_c)
+
+                valid_obs_ids.sort(key=get_distance)
+
+                # 3. 主轨迹更新 (Inherit)
+                # ✨ 关键点：分裂时，观测中心必然偏离原合并中心。
+                # 使用 inflation=10.0 (甚至更大)，告诉 KF：
+                # "虽然我把这个观测给了你，但位置可能不准，请保持你原有的速度方向！"
+                best_idx = valid_obs_ids[0]
+                tr.update(obs[best_idx], inflation=10.0)
+                tr.match_mode = MatchMode.ONE2MANY
+
+                # 4. 分支克隆 (Clone)
+                for o_id in valid_obs_ids[1:]:
+                    # Clone 时，历史轨迹是完全复制的
+                    branch_track = tr.clone(time)
+
+                    # A. 状态设为 TENTATIVE，重置 hit_count
+                    branch_track.state = TrackState.TENTATIVE
+                    branch_track.hit_count = 1
+
+                    # B. 分支更新
+                    # 对于分支，因为它代表分离出去的新物体，它的位置确实是新的观测位置。
+                    # 但因为它继承了母体的速度（可能很大），为了防止它第一帧就乱飞，
+                    # 给它一个适度的 inflation (如 5.0)，让它在位置上稍微“软”着陆，
+                    # 或者完全信任观测 (inflation=1.0)，取决于你对新分支的信任度。
+                    # 建议：也稍微 inflate 一下，防止速度突变过大
+                    branch_track.update(obs[o_id], inflation=5.0)
+
+                    branch_track.match_mode = MatchMode.ONE2MANY
+                    new_tracks.append(branch_track)
+
+            self.tracks.extend(new_tracks)
+
+        # ---------- 6️⃣ 多对一 & 7️⃣ 多对多（交集更新） ----------
         groups_by_i = {}
-        for i, j in group_i_multi:
-            groups_by_i.setdefault(i, []).append(j)
+        for i, j in group_i_multi: groups_by_i.setdefault(i, []).append(j)
+        for i, p_ids in groups_by_i.items():
+            if obs_el_labels[i] not in [2, 3]: continue
+            for j in p_ids:
+                l, r = max(obs[i][0], preds[j][0]), min(obs[i][1], preds[j][1])
+                self.tracks[j].match_mode = MatchMode.MANY2ONE
+                if r > l: self.tracks[j].update((l, r))
 
-        for i, pred_ids in groups_by_i.items():
-            if obs_el_labels[i] not in [2, 3]:
-                continue
-
-            obs_i = obs[i]
-            for j in pred_ids:
-                pred_j = preds[j]
-                left = max(obs_i[0], pred_j[0])
-                right = min(obs_i[1], pred_j[1])
-
-                if right > left:
-                    self.tracks[j].update((left, right))
-
-        # ==========================================================
-        # 7️⃣ 多对多（已转为多对一）→ 交集更新
-        # ==========================================================
         for g in group_mm:
-            obs_i = g["merged_obs"]
             for j in g["pred_ids"]:
-                pred_j = preds[j]
-                left = max(obs_i[0], pred_j[0])
-                right = min(obs_i[1], pred_j[1])
+                l, r = max(g["merged_obs"][0], preds[j][0]), min(g["merged_obs"][1], preds[j][1])
+                self.tracks[j].match_mode = MatchMode.MANY2ONE
+                if r > l: self.tracks[j].update((l, r))
 
-                if right > left:
-                    self.tracks[j].update((left, right))
-
-        # ==========================================================
-        # 8️⃣ 新生轨迹
-        # ==========================================================
+        # ---------- 8️⃣ 新生轨迹 ----------
         for i in unmatched_ob:
             if self.left_b[0] <= obs[i][1] <= self.left_b[1] and obs_el_labels[i] in [2, 3]:
-                tr = Track(obs[i], right_b=self.right_b, state=TrackState.TENTATIVE)
-                self.tracks.append(tr)
+                self.tracks.append(Track(obs[i], right_b=self.right_b))
 
-        # 此时self.tracks中，有些已经update，状态空间更新为当前时刻；未匹配到的还是预测状态；新加入的只有clone环节，也已经更新过。
-        # ---------- 记录历史 ----------
+        # ---------- 记录历史与清理 ----------
         alive = []
         for tr in self.tracks:
-            if tr.x[0, 0] > self.right_b:
+            tr.step_tentative(tr.matched, max_age=self.max_age)
+            if tr.status == "delete":
                 self.records[tr.id] = tr.history
                 continue
-            if tr.state == TrackState.TENTATIVE:  # 对于临时的轨迹
-                matched = tr.updated  # 本帧是否 update
-                tr.step_tentative(matched, max_age=self.max_age)
-                if tr.status == "delete":  # 已经移除了删除的轨迹
-                    self.records[tr.id] = tr.history  # 删除时才加入记录
-                    continue
             alive.append(tr)
             tr.history.append(tr.snapshot(time))
         self.tracks = alive
-
         self.tracks.sort(key=lambda t: t.x[0, 0])
 
-    def predict(self):  # 对alive的轨迹进行预测, 匹配到的预测，未匹配到的也预测
-        """
-
-        self.tracks' cases
-        state: Tentative, Confirmed
-        status: tentative, confirmed, delete
-        status <= state
-        updated: True, False
-        age,
-        """
+    def predict(self):
         for tr in self.tracks:
-            use_ls = (tr.status == "confirmed") and (not tr.updated)
+            if tr.match_mode == MatchMode.MANY2ONE and not tr.matched: continue
+            use_ls = (tr.status == "confirmed") and (not tr.matched)
             tr.predict(use_ls)
-
-        # to_delete = []
-        #
-        # for t in self.tracks:
-        #     if t.age <= self.max_age or t.updated == True:
-        #         t.predict()
-        #     else:
-        #         t.missed = True
-        #         self.records[t.id] = t.history
-        #         to_delete.append(t)
-        #
-        # for t in to_delete:
-        #     self.tracks.remove(t)
 
     @staticmethod
     def _classify(el):
-        """
-        脉冲分三类
-        :param el: ndarray, shape (N, 2)
-                   第一列 e，第二列 l
-        :return: list[int]，分类结果（1,2,3）
-        """
-        t1 = [15, 50]   # [15, 50]
-        t2 = [50, 100]
-
+        t1, t2 = [10, 35], [50, 100]
         labels = []
-
         for e, l in el:
             if e <= t1[0] and l <= t1[1]:
                 labels.append(1)
@@ -276,96 +200,20 @@ class Tracker:
                 labels.append(3)
             else:
                 labels.append(2)
-
         return labels
-
-    @staticmethod
-    def get_el(pulses, sig):
-        l = np.array([i[1] - i[0] for i in pulses])
-        e = np.array([sum(sig[int(i[0]):int(i[1])]**2) for i in pulses])
-        return np.c_[e, l]
 
     def _initiate(self, measurements):
         for m in measurements:
-            tr = Track(m, right_b=self.right_b, state=TrackState.TENTATIVE)
-            self.tracks.append(tr)
+            self.tracks.append(Track(m, right_b=self.right_b))
 
     @staticmethod
     def iou(a, b):
-        """
-        a, b: 一维区间 [l, r]
-        返回 IoU ∈ [0, 1]
-        """
-        left = max(a[0], b[0])
-        right = min(a[1], b[1])
-
-        inter = max(0.0, right - left)
-        if inter == 0:
-            return 0.0
-
-        len_a = a[1] - a[0]
-        len_b = b[1] - b[0]
-        union = len_a + len_b - inter
-
-        return inter / union
-
-    @staticmethod
-    def split_interval_by_ratio(I, intervals):
-        """
-        I: tuple (a, b)
-        intervals: list of tuples [(l1, r1), (l2, r2), ..., (lk, rk)]
-
-        return: list of k sub-intervals of I
-        """
-        a, b = I
-        L = b - a
-
-        lengths = [r - l for l, r in intervals]
-        total = sum(lengths)
-
-        if total <= 0:
-            raise ValueError("区间总长度必须大于 0")
-
-        result = []
-        cur = a
-
-        for li in lengths:
-            seg_len = L * li / total
-            next_cur = cur + seg_len
-            result.append((cur, next_cur))
-            cur = next_cur
-
-        return result
+        inter = max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+        if inter == 0: return 0.0
+        return inter / ((a[1] - a[0]) + (b[1] - b[0]) - inter)
 
     def get_track_state_by_id(self, tid):
-        """
-        根据 track id 返回状态
-        """
         for t in self.tracks:
-            if t.id == tid:
-                return t.get_state()
+            if t.id == tid: return t.get_state()
         return None
-
-
-if __name__ == "__main__":
-    from matplotlib import rcParams
-    from plot import plot_histories, plot_observations_with_centers
-    import pandas as pd
-    rcParams['font.family'] = "Times New Roman"
-    tmp = []
-    for i in tqdm(range(1, 6)):
-        arr = np.load(f"D:/code/fiber/data/npy/{i}.npy")[:, 100:2800]
-        Observations = np.load("D:/code/fiber/gitCode/pulseDL/Pred_intervals.npy", allow_pickle=True)[(i-1)*300:i*300]
-
-        tracker = Tracker()
-        for t, m in enumerate(Observations):
-            tracker.update(m, t, arr[t])
-            tracker.predict()
-
-        for tr in tracker.tracks:
-            tracker.records[tr.id] = tr.history
-
-        # pd.DataFrame(tmp).to_csv("aa.csv", index=False)
-        plot_histories(tracker.records, savepath=f"tracks_v3_one2m_{i}.png")
-        # plot_observations_with_centers(Observations, save_path=f"ob_with_centers_{i}.png")
 
